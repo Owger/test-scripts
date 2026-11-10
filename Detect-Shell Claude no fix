@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# =====================================================================
+# MITRE ATT&CK T1059.004 - Unix Shell: DETECT + HARDEN
+#
+# Detection (always runs, read-only):
+#   - Executable files sitting in /tmp, /var/tmp, /dev/shm
+#   - Suspicious shell patterns in auditd logs and user bash histories
+#     (base64 | bash, curl/wget | sh, bash -c, history tampering)
+#   - Whether execve auditing and noexec temp mounts are in place
+#
+# Hardening (only with --fix):
+#   1. Install auditd rules that log every execve (key: t1059_004)
+#   2. Remount /tmp, /var/tmp, /dev/shm with noexec,nosuid,nodev
+#      and persist it in /etc/fstab (backup taken first)
+#   3. Quarantine executable files found in temp dirs
+#   4. Lock shell history so it can't be silently disabled
+#
+# Usage:  sudo ./t1059_004_defend.sh          (report only)
+#         sudo ./t1059_004_defend.sh --fix    (report + harden)
+# =====================================================================
+ 
+set -u
+FIX=0; [[ "${1:-}" == "--fix" ]] && FIX=1
+REPORT="/var/log/t1059_004_report.log"
+QUARANTINE="/root/t1059_quarantine"
+AUDIT_RULES="/etc/audit/rules.d/t1059_004.rules"
+TMP_DIRS=(/tmp /var/tmp /dev/shm)
+FINDINGS=0
+ 
+[[ $EUID -ne 0 ]] && { echo "Run as root (sudo)."; exit 1; }
+ 
+log()  { echo "[$(date '+%F %T')] $*" | tee -a "$REPORT"; }
+hit()  { FINDINGS=$((FINDINGS+1)); log "  [!] $*"; }
+ok()   { log "  [ok] $*"; }
+ 
+# Regex for suspicious shell use
+PATTERN='base64 (-d|--decode).*\|.*(ba|da|z)?sh|(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|da|z)?sh|unset HISTFILE|HISTSIZE=0|history -c|/dev/tcp/|(ba)?sh -i'
+ 
+log "===== T1059.004 scan on $(hostname) (fix mode: $FIX) ====="
+ 
+# ---------------------------------------------------------------------
+# DETECT 1: executables in world-writable temp dirs
+# ---------------------------------------------------------------------
+log "[1] Executable files in temp directories"
+mapfile -t TMP_EXECS < <(find "${TMP_DIRS[@]}" -xdev -type f -perm /111 2>/dev/null)
+if (( ${#TMP_EXECS[@]} )); then
+  for f in "${TMP_EXECS[@]}"; do hit "executable: $f ($(head -c 60 "$f" 2>/dev/null | tr -d '\0' | head -n1))"; done
+else
+  ok "none found"
+fi
+ 
+# ---------------------------------------------------------------------
+# DETECT 2: temp mounts missing noexec
+# ---------------------------------------------------------------------
+log "[2] noexec on temp mounts"
+for d in "${TMP_DIRS[@]}"; do
+  opts=$(findmnt -no OPTIONS "$d" 2>/dev/null)
+  if [[ -z "$opts" ]]; then
+    hit "$d is not a separate mount (cannot set noexec without one)"
+  elif [[ "$opts" != *noexec* ]]; then
+    hit "$d mounted without noexec ($opts)"
+  else
+    ok "$d has noexec"
+  fi
+done
+ 
+# ---------------------------------------------------------------------
+# DETECT 3: execve auditing
+# ---------------------------------------------------------------------
+log "[3] auditd execve logging"
+if ! command -v auditctl >/dev/null 2>&1; then
+  hit "auditd not installed (apt install auditd)"
+elif auditctl -l 2>/dev/null | grep -q 'execve'; then
+  ok "execve audit rule active"
+else
+  hit "no execve audit rule loaded"
+fi
+ 
+# ---------------------------------------------------------------------
+# DETECT 4: suspicious commands in audit log
+# ---------------------------------------------------------------------
+log "[4] Suspicious shell activity in audit log"
+if command -v ausearch >/dev/null 2>&1; then
+  matches=$(ausearch -m EXECVE -i 2>/dev/null | grep -Ei "$PATTERN" | head -n 25)
+  if [[ -n "$matches" ]]; then
+    while IFS= read -r l; do hit "audit: ${l:0:200}"; done <<< "$matches"
+  else
+    ok "no matches"
+  fi
+else
+  log "  [-] ausearch unavailable, skipped"
+fi
+ 
+# ---------------------------------------------------------------------
+# DETECT 5: suspicious commands in user shell histories
+# ---------------------------------------------------------------------
+log "[5] Suspicious entries in shell histories"
+found=0
+for h in /root/.bash_history /home/*/.bash_history /root/.zsh_history /home/*/.zsh_history; do
+  [[ -f "$h" ]] || continue
+  while IFS= read -r l; do hit "$h: ${l:0:200}"; found=1; done < <(grep -Ei "$PATTERN" "$h" 2>/dev/null)
+  # A history file symlinked to /dev/null is a classic evasion trick
+  [[ -L "$h" && "$(readlink -f "$h")" == /dev/null ]] && { hit "$h symlinked to /dev/null"; found=1; }
+done
+(( found )) || ok "no matches"
+ 
+log "Scan complete: $FINDINGS finding(s)."
+ 
+# =====================================================================
+# HARDENING (only with --fix)
+# =====================================================================
+if (( ! FIX )); then
+  log "Report-only mode. Re-run with --fix to harden."
+  exit 0
+fi
+ 
+log "===== Applying hardening ====="
+ 
+# FIX 1: audit every execve so shell use always lands in Splunk
+if ! command -v auditctl >/dev/null 2>&1; then
+  log "[fix1] Installing auditd"
+  apt-get install -y auditd audispd-plugins >/dev/null 2>&1 || log "  [x] auditd install failed (no network?)"
+fi
+if command -v auditctl >/dev/null 2>&1; then
+  cat > "$AUDIT_RULES" <<'EOF'
+## T1059.004 - log all program execution
+-a always,exit -F arch=b64 -S execve -k t1059_004
+-a always,exit -F arch=b32 -S execve -k t1059_004
+## Watch shell config files attackers modify for persistence/evasion
+-w /etc/profile -p wa -k t1059_004_shellcfg
+-w /etc/profile.d/ -p wa -k t1059_004_shellcfg
+-w /etc/bash.bashrc -p wa -k t1059_004_shellcfg
+EOF
+  augenrules --load >/dev/null 2>&1 || auditctl -R "$AUDIT_RULES" >/dev/null 2>&1
+  systemctl enable --now auditd >/dev/null 2>&1
+  log "[fix1] audit rules installed at $AUDIT_RULES"
+fi
+ 
+# FIX 2: noexec on temp dirs (now + persistent)
+cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
+for d in "${TMP_DIRS[@]}"; do
+  if findmnt "$d" >/dev/null 2>&1; then
+    mount -o remount,noexec,nosuid,nodev "$d" && log "[fix2] remounted $d noexec"
+  elif [[ "$d" == /var/tmp ]]; then
+    # bind /var/tmp onto /tmp so it inherits noexec
+    mount --bind /tmp /var/tmp && log "[fix2] bound /var/tmp -> /tmp"
+  fi
+done
+grep -qE '^\S+\s+/tmp\s'     /etc/fstab || echo 'tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev,mode=1777 0 0' >> /etc/fstab
+grep -qE '^\S+\s+/dev/shm\s' /etc/fstab || echo 'tmpfs /dev/shm tmpfs defaults,noexec,nosuid,nodev 0 0'    >> /etc/fstab
+grep -qE '^\S+\s+/var/tmp\s' /etc/fstab || echo '/tmp /var/tmp none bind 0 0'                              >> /etc/fstab
+log "[fix2] fstab updated (backup saved next to it)"
+ 
+# FIX 3: quarantine executables found in temp dirs
+if (( ${#TMP_EXECS[@]} )); then
+  mkdir -p "$QUARANTINE"; chmod 700 "$QUARANTINE"
+  for f in "${TMP_EXECS[@]}"; do
+    [[ -f "$f" ]] || continue
+    dest="$QUARANTINE/$(date +%s)_$(basename "$f")"
+    sha256sum "$f" >> "$QUARANTINE/hashes.txt"
+    mv "$f" "$dest" && chmod 000 "$dest" && log "[fix3] quarantined $f -> $dest"
+  done
+fi
+ 
+# FIX 4: make shell history tamper-resistant
+cat > /etc/profile.d/zz-t1059-history.sh <<'EOF'
+# T1059.004 hardening: keep history on, timestamped, and written immediately
+export HISTFILE="$HOME/.bash_history"
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+export HISTTIMEFORMAT='%F %T '
+export PROMPT_COMMAND='history -a'
+readonly HISTFILE HISTSIZE HISTFILESIZE HISTTIMEFORMAT PROMPT_COMMAND
+shopt -s histappend
+EOF
+chmod 644 /etc/profile.d/zz-t1059-history.sh
+log "[fix4] history lock installed (applies to new logins)"
+ 
+log "Hardening done. Re-run without --fix to verify."
+ 
