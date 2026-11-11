@@ -7,6 +7,9 @@
 #   - Suspicious shell patterns in auditd logs and user bash histories
 #     (base64 | bash, curl/wget | sh, bash -c, history tampering)
 #   - Whether execve auditing and noexec temp mounts are in place
+#   - LIVE bind/reverse shell LISTENERS: listening sockets served by a
+#     shell/interpreter/nc/socat, and shell processes holding network
+#     connections, FIFO-backed shells, and shells with no controlling tty
 #
 # Hardening (only with --fix):
 #   1. Install auditd rules that log every execve (key: t1059_004)
@@ -14,18 +17,35 @@
 #      and persist it in /etc/fstab (backup taken first)
 #   3. Quarantine executable files found in temp dirs
 #   4. Lock shell history so it can't be silently disabled
+#   5. Terminate confirmed bind/reverse shell listeners (opt-in prompt;
+#      --yes to skip prompt), after capturing forensic evidence
 #
-# Usage:  sudo ./t1059_004_defend.sh          (report only)
-#         sudo ./t1059_004_defend.sh --fix    (report + harden)
+# Usage:  sudo ./t1059_004_defend.sh            (report only)
+#         sudo ./t1059_004_defend.sh --fix      (report + harden)
+#         sudo ./t1059_004_defend.sh --fix --yes (harden + kill listeners,
+#                                                 no interactive prompt)
 # =====================================================================
  
 set -u
-FIX=0; [[ "${1:-}" == "--fix" ]] && FIX=1
+FIX=0; ASSUME_YES=0
+for arg in "$@"; do
+  case "$arg" in
+    --fix) FIX=1 ;;
+    --yes|-y) ASSUME_YES=1 ;;
+    -h|--help)
+      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)"; exit 2 ;;
+  esac
+done
 REPORT="/var/log/t1059_004_report.log"
 QUARANTINE="/root/t1059_quarantine"
 AUDIT_RULES="/etc/audit/rules.d/t1059_004.rules"
 TMP_DIRS=(/tmp /var/tmp /dev/shm)
+# Programs that, when they own a LISTENing socket, are classic bind-shell payloads.
+SHELL_LISTENERS='^(bash|sh|dash|zsh|ksh|ash|busybox|nc|ncat|netcat|socat|perl|python[0-9.]*|php|ruby|lua|telnet)$'
 FINDINGS=0
+LISTENER_PIDS=()
  
 [[ $EUID -ne 0 ]] && { echo "Run as root (sudo)."; exit 1; }
  
@@ -103,7 +123,107 @@ for h in /root/.bash_history /home/*/.bash_history /root/.zsh_history /home/*/.z
   [[ -L "$h" && "$(readlink -f "$h")" == /dev/null ]] && { hit "$h symlinked to /dev/null"; found=1; }
 done
 (( found )) || ok "no matches"
- 
+
+# ---------------------------------------------------------------------
+# DETECT 6: live bind / reverse shell LISTENERS and shell network I/O
+#   This is the heart of a T1059.004 bind-shell check: a process that
+#   listens on a socket (bind shell) or holds an outbound connection
+#   (reverse shell) while being, or feeding, an interactive shell.
+# ---------------------------------------------------------------------
+log "[6] Live bind/reverse shell listeners"
+lfound=0
+
+# Pick the best available socket tool once.
+if command -v ss >/dev/null 2>&1; then
+  SOCK_TOOL="ss"
+elif command -v netstat >/dev/null 2>&1; then
+  SOCK_TOOL="netstat"
+else
+  SOCK_TOOL=""
+  log "  [-] neither ss nor netstat available; walking /proc instead"
+fi
+
+inspect_pid() {   # $1 pid, $2 context label
+  local pid="$1" ctx="$2" comm exe cmd tty
+  [[ -r "/proc/$pid/comm" ]] || return 0
+  comm=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null)
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+  if [[ "$comm" =~ $SHELL_LISTENERS ]]; then
+    hit "$ctx pid=$pid comm=$comm exe=${exe:-?} cmd=${cmd:0:160}"
+    LISTENER_PIDS+=("$pid"); lfound=1
+  fi
+}
+
+if [[ -n "$SOCK_TOOL" ]]; then
+  if [[ "$SOCK_TOOL" == "ss" ]]; then
+    # LISTEN sockets with owning process.
+    while IFS= read -r line; do
+      [[ "$line" == *users:* ]] || continue
+      laddr=$(awk '{print $5}' <<<"$line")
+      # extract every pid=NNNN in the users:(...) blob
+      while read -r pid; do inspect_pid "$pid" "LISTEN on $laddr ->"; done \
+        < <(grep -oE 'pid=[0-9]+' <<<"$line" | cut -d= -f2 | sort -u)
+    done < <(ss -Hlpntu 2>/dev/null)
+
+    # ESTABLISHED/connected sockets owned by a shell (reverse-shell signature).
+    while IFS= read -r line; do
+      [[ "$line" == *users:* ]] || continue
+      laddr=$(awk '{print $5}' <<<"$line"); raddr=$(awk '{print $6}' <<<"$line")
+      while read -r pid; do
+        comm=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null)
+        [[ "$comm" =~ $SHELL_LISTENERS ]] && inspect_pid "$pid" "CONNECTED $laddr<->$raddr ->"
+      done < <(grep -oE 'pid=[0-9]+' <<<"$line" | cut -d= -f2 | sort -u)
+    done < <(ss -Hpntu state connected 2>/dev/null)
+  else
+    # netstat fallback: columns end with pid/program.
+    while IFS= read -r line; do
+      prog=$(awk '{print $NF}' <<<"$line")          # e.g. 1234/bash
+      pid=${prog%%/*}
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      case "$line" in
+        *LISTEN*) inspect_pid "$pid" "LISTEN ->" ;;
+        *ESTABLISHED*)
+          comm=$(tr -d '\0' < "/proc/$pid/comm" 2>/dev/null)
+          [[ "$comm" =~ $SHELL_LISTENERS ]] && inspect_pid "$pid" "CONNECTED ->" ;;
+      esac
+    done < <(netstat -tunp 2>/dev/null | tail -n +3)
+  fi
+fi
+
+# Extra signal: interactive shells with a network socket but NO controlling
+# tty (typical of nc/socat-spawned shells), found straight from /proc.
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  comm=$(tr -d '\0' < "$d/comm" 2>/dev/null) || continue
+  [[ "$comm" =~ ^(bash|sh|dash|zsh|ksh|ash)$ ]] || continue
+  # has at least one socket fd?
+  has_sock=0
+  for fd in "$d"/fd/*; do
+    [[ "$(readlink -f "$fd" 2>/dev/null)" == socket:* ]] && { has_sock=1; break; }
+  done
+  (( has_sock )) || continue
+  # controlling tty of 0 in stat field 7 means no tty
+  tty_nr=$(awk '{print $7}' "$d/stat" 2>/dev/null)
+  if [[ "$tty_nr" == "0" ]]; then
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    hit "shell with network socket and no controlling tty: pid=$pid comm=$comm cmd=${cmd:0:160}"
+    LISTENER_PIDS+=("$pid"); lfound=1
+  fi
+done
+
+# FIFO-backed bind shells: mkfifo + nc/sh loop leaves a named pipe behind.
+while IFS= read -r p; do
+  hit "named pipe (possible FIFO bind shell backchannel): $p"; lfound=1
+done < <(find "${TMP_DIRS[@]}" -xdev -type p 2>/dev/null)
+
+(( lfound )) || ok "no live shell listeners detected"
+
+# De-duplicate the kill list.
+if (( ${#LISTENER_PIDS[@]} )); then
+  mapfile -t LISTENER_PIDS < <(printf '%s\n' "${LISTENER_PIDS[@]}" | sort -un)
+fi
+
 log "Scan complete: $FINDINGS finding(s)."
  
 # =====================================================================
@@ -175,6 +295,52 @@ shopt -s histappend
 EOF
 chmod 644 /etc/profile.d/zz-t1059-history.sh
 log "[fix4] history lock installed (applies to new logins)"
- 
+
+# FIX 5: neutralize confirmed bind/reverse shell listeners
+#   Destructive, so it is opt-in: capture evidence first, then prompt
+#   (unless --yes) before killing. Never auto-kills without confirmation.
+if (( ${#LISTENER_PIDS[@]} )); then
+  mkdir -p "$QUARANTINE"; chmod 700 "$QUARANTINE"
+  evidence="$QUARANTINE/listeners_$(date +%s).txt"
+  {
+    echo "# bind/reverse shell listener evidence captured $(date '+%F %T')"
+    for pid in "${LISTENER_PIDS[@]}"; do
+      [[ -d "/proc/$pid" ]] || continue
+      echo "=== pid $pid ==="
+      echo "comm:   $(tr -d '\0' < /proc/$pid/comm 2>/dev/null)"
+      echo "exe:    $(readlink -f /proc/$pid/exe 2>/dev/null)"
+      echo "cmdline:$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)"
+      echo "cwd:    $(readlink -f /proc/$pid/cwd 2>/dev/null)"
+      ls -l "/proc/$pid/fd" 2>/dev/null
+      echo
+    done
+  } > "$evidence"
+  log "[fix5] evidence for ${#LISTENER_PIDS[@]} suspect PID(s) saved to $evidence"
+
+  do_kill=0
+  if (( ASSUME_YES )); then
+    do_kill=1
+  elif [[ -t 0 ]]; then
+    read -r -p "Kill ${#LISTENER_PIDS[@]} suspected shell listener(s) [${LISTENER_PIDS[*]}]? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && do_kill=1
+  else
+    log "[fix5] not a TTY and --yes not given; leaving PIDs running (evidence saved)"
+  fi
+
+  if (( do_kill )); then
+    for pid in "${LISTENER_PIDS[@]}"; do
+      [[ -d "/proc/$pid" ]] || continue
+      # Don't kill PID 1 or our own process tree.
+      if [[ "$pid" == "1" || "$pid" == "$$" || "$pid" == "$PPID" ]]; then
+        log "[fix5] refusing to kill protected pid=$pid"; continue
+      fi
+      kill -TERM "$pid" 2>/dev/null
+      sleep 1
+      if [[ -d "/proc/$pid" ]]; then kill -KILL "$pid" 2>/dev/null; fi
+      [[ -d "/proc/$pid" ]] || log "[fix5] terminated suspect listener pid=$pid"
+    done
+  fi
+fi
+
 log "Hardening done. Re-run without --fix to verify."
  
